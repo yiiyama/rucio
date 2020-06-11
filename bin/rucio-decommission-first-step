@@ -1,0 +1,44 @@
+#!/usr/bin/env python
+
+from __future__ import division
+from __future__ import print_function
+
+import argparse
+
+from rucio.core.rse import get_rse_id, update_rse
+from rucio.common import exception
+from rucio.db.sqla.session import transactional_session
+
+def get_parser():
+    """
+    Returns the argparse parser.
+    """
+    parser = argparse.ArgumentParser(description='First step for writing a decommissioning agent.')
+    parser.add_argument('rse', action='store', nargs='+', help='RSE to decommission')
+    return parser
+
+@transactional_session
+def prepare_rse_for_decommissioning(rse, session=None):
+    """
+    Set RSE attributes for decommissioning (read=True, write=False, delete=True).
+
+    :param rse:      Name of the RSE.
+    :param session:  The database session.
+    """
+    
+    try:
+        rse_id = get_rse_id(rse, session=session)
+        update_rse(rse_id, {'availability_read': True, 'availability_write': False, 'availability_delete': True}, session=session)
+
+    except exception.RSENotFound:
+        return False
+
+    return True
+
+
+if __name__ == "__main__":
+    parser = get_parser()
+    args = parser.parse_args()
+
+    for rse in args.rse:
+        prepare_rse_for_decommissioning(rse)
