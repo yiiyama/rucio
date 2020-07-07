@@ -3,11 +3,23 @@
 from __future__ import division
 from __future__ import print_function
 
+import logging
+import sys
+
 import argparse
 
-from rucio.core.rse import get_rse_id, update_rse
+from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse
 from rucio.common import exception
 from rucio.db.sqla.session import transactional_session
+
+from rucio.core.lock import get_dataset_locks_by_rse_id
+
+logging.basicConfig(stream=sys.stdout,
+                    level=getattr(logging,
+                                  config_get('common', 'loglevel',
+                                             raise_exception=False,
+                                             default='DEBUG').upper()),
+                    format='%(asctime)s\t%(process)d\t%(levelname)s\t%(message)s')
 
 def get_parser():
     """
@@ -15,23 +27,49 @@ def get_parser():
     """
     parser = argparse.ArgumentParser(description='First step for writing a decommissioning agent.')
     parser.add_argument('rse', action='store', nargs='+', help='RSE to decommission')
+    #parser.add_argument('--dry-run', action='store_true', help='Dry run')
+    parser.add_argument('--run', action='store_true', help='Actually run')
     return parser
 
+# policies
+JUST_DELETE, MOVE = range(2)
+
 @transactional_session
-def prepare_rse_for_decommissioning(rse, session=None):
+def decommission_rse(rse, policy, dry_run=False, session=None):
     """
     Set RSE attributes for decommissioning (read=True, write=False, delete=True).
 
     :param rse:      Name of the RSE.
     :param session:  The database session.
     """
+
+    logging.info('Decommissioning: Preparing RSE %(rse)s' % locals())
     
     try:
         rse_id = get_rse_id(rse, session=session)
-        update_rse(rse_id, {'availability_read': True, 'availability_write': False, 'availability_delete': True}, session=session)
-
     except exception.RSENotFound:
+        logging.warning('RSE %(rse) not found' % locals())
         return False
+
+    # Set the RSE attributes
+    for key, value in [('availability_read', True), ('availability_write', False), ('availability_delete', True), ('greedyDeletion', True)]:
+        current = get_rse_attribute(key, rse_id=rse_id)
+        if current is not value:
+            logging.debug('RSE: %(rse)s, updating attribute %(key)s (%(current)s => %(value)s)' % locals())
+            if not dry_run:
+                update_rse(rse_id, {key: value}, session=session)
+
+    dataset_locks = get_dataset_locks_by_rse_id(rse_id, session=session)
+    for lock in dataset_locks:
+        print(lock)
+
+    if policy == JUST_DELETE:
+        pass
+        # Delete the replication rules
+
+        # Delete the remaining locks
+
+        # Delete the replicas
 
     return True
 
@@ -41,4 +79,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     for rse in args.rse:
-        prepare_rse_for_decommissioning(rse)
+        decommission_rse(rse, JUST_DELETE, dry_run=(not args.run))
