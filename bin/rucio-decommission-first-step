@@ -11,7 +11,7 @@ import argparse
 from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse
 from rucio.core.lock import get_dataset_locks
 from rucio.core.replica import list_datasets_per_rse
-from rucio.core.rule import list_rules
+from rucio.core.rule import list_rules, __delete_lock_and_update_replica
 from rucio.core.rse_expression_parser import parse_expression
 
 from rucio.common import exception
