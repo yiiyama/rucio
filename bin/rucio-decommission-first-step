@@ -10,9 +10,15 @@ import argparse
 
 from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse
 from rucio.common import exception
+from rucio.common.config import config_get
 from rucio.db.sqla.session import transactional_session
+from rucio.db.sqla import models
 
 from rucio.core.lock import get_dataset_locks_by_rse_id
+from rucio.core.replica import list_datasets_per_rse
+from rucio.core.rule import list_rules
+from rucio.api.did import list_dids
+import rucio.core.rse as core_rse
 
 logging.basicConfig(stream=sys.stdout,
                     level=getattr(logging,
@@ -46,10 +52,13 @@ def decommission_rse(rse, policy, dry_run=False, session=None):
     logging.info('Decommissioning: Preparing RSE %(rse)s' % locals())
     
     try:
-        rse_id = get_rse_id(rse, session=session)
+        rse_id = get_rse_id(rse, session=session, include_deleted=False)
     except exception.RSENotFound:
         logging.warning('RSE %(rse) not found' % locals())
         return False
+
+    #logging.info(list(list_dids(scope='user.yiiyama', filters={'name': '*'}, type='dataset')))
+    #return True
 
     # Set the RSE attributes
     for key, value in [('availability_read', True), ('availability_write', False), ('availability_delete', True), ('greedyDeletion', True)]:
@@ -58,6 +67,22 @@ def decommission_rse(rse, policy, dry_run=False, session=None):
             logging.debug('RSE: %(rse)s, updating attribute %(key)s (%(current)s => %(value)s)' % locals())
             if not dry_run:
                 update_rse(rse_id, {key: value}, session=session)
+
+    print(core_rse.get_rse(rse_id, session=session))
+    print(core_rse.rse_is_empty(rse_id, session=session))
+
+    # List all datasets on the RSE
+    # (We have no straightforward way of listing the rules per RSE, so we go from datasets to rules)
+    datasets_with_no_rule = []
+    logging.info(list(list_datasets_per_rse(rse_id, filters={}, session=session)))
+    for row in list_datasets_per_rse(rse_id, session=session):
+        logging.info(row)
+        rule = list_rules(filters={'scope': row['scope'], 'name': row['name']}, session=session)
+        logging.info(rule)
+        break
+
+    return True
+
 
     dataset_locks = get_dataset_locks_by_rse_id(rse_id, session=session)
     for lock in dataset_locks:
