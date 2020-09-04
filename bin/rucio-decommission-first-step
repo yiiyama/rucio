@@ -8,14 +8,17 @@ import sys
 
 import argparse
 
-from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse
+from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse, get_rses_with_attribute
 from rucio.core.lock import get_dataset_locks
-from rucio.core.replica import list_datasets_per_rse
+from rucio.core.replica import list_datasets_per_rse, delete_replicas
+from rucio.core.did import list_all_parent_dids
 from rucio.core.rule import list_rules, __delete_lock_and_update_replica
 from rucio.core.rse_expression_parser import parse_expression
 
 from rucio.common import exception
 from rucio.common.config import config_get
+from rucio.common.dumper.data_models import Replica as ReplicaDumper
+from rucio.common.dumper import smart_open
 from rucio.db.sqla.session import transactional_session
 from rucio.db.sqla import models
 
@@ -31,13 +34,16 @@ def get_parser():
     Returns the argparse parser.
     """
     parser = argparse.ArgumentParser(description='First step for writing a decommissioning agent.')
-    parser.add_argument('rse', action='store', nargs='+', help='RSE to decommission')
+    parser.add_argument('--rse', action='store', nargs='+', default=[], help='RSE to decommission')
+    parser.add_argument('--max_terabytes', action='store', type=float, default=0.01, help='Default throttling.')
     #parser.add_argument('--dry-run', action='store_true', help='Dry run')
     parser.add_argument('--run', action='store_true', help='Actually run')
     return parser
 
-# policies
+# Policies
 JUST_DELETE, MOVE = range(2)
+
+USE_DUMP_FOR_REPLICAS = False
 
 @transactional_session
 def decommission_rse(rse, policy, max_terabytes=None, dry_run=False, session=None):
@@ -81,6 +87,8 @@ def decommission_rse(rse, policy, max_terabytes=None, dry_run=False, session=Non
                 raise TotalVolumeExceeded(self.total_volume)
 
     check_volume = VolumeCheck()
+    
+    deferred_action = set()
 
     try:
         # List all datasets on the RSE
@@ -91,29 +99,37 @@ def decommission_rse(rse, policy, max_terabytes=None, dry_run=False, session=Non
             scope = dataset['scope']
             name = dataset['name']
     
+            # Loop over all the rules for the dataset
+            # If there is a rule that lists the RSE solo, act on it and break from the loop
             rules = []
             for rule in list_rules(filters={'scope': scope, 'name': name}, session=session):
-                # Simple RSE expression
-                if rule['rse_expression'] == rse:
-                    rule_id = rule['id']
-                    if policy == JUST_DELETE:
-                        logging.debug('RSE: %(rse)s -- Deleting rule %(rule_id)s for dataset %(scope)s:%(name)s' % locals())
-                        if not dry_run:
-                            delete_rule(rule_id, delete_parent=True, session=session)
-                    else:
-                        pass
-
-                    check_volume(dataset['bytes'])
-                    break
-    
+                # Locally saving the rules so that we don't have to call list_rules again
                 rules.append(rule)
+                
+                # Simple RSE expression
+                if rule['rse_expression'] != rse:
+                    continue
+                    
+                rule_id = rule['id']
+                if policy == JUST_DELETE:
+                    logging.debug('RSE: %(rse)s -- Deleting rule %(rule_id)s for dataset %(scope)s:%(name)s' % locals())
+                    if not dry_run:
+                        delete_rule(rule_id, delete_parent=True, session=session)
+                else:
+                    pass
+
+                check_volume(dataset['bytes'])
+                break
     
             else:
-                # No rule with simple RSE expression - check for nontrivial ones
+                # Loop over rules didn't break
+                # -> No rule with simple RSE expression - check for nontrivial ones
                 for rule in rules:
                     for rse_info in parse_expression(rule['rse_expression'], session=session):
                         if rse_info['rse'] == rse:
+                            # The rse_expression for this rule contains the current RSE among others
                             logging.warning('RSE: %(rse)s -- Nontrivial rule for dataset %(scope)s:%(name)s. Deferring action' % locals())
+                            deferred_action.add('%(scope)s:%(name)s' % locals())
                             break
     
                     else:
@@ -125,32 +141,110 @@ def decommission_rse(rse, policy, max_terabytes=None, dry_run=False, session=Non
             scope = dataset['scope']
             name = dataset['name']
             for lock in get_dataset_locks(scope, name, session=session):
-                if lock['rse_id'] == rse_id:
-                    if policy == JUST_DELETE:
-                        logging.debug('RSE: %(rse)s -- Deleting out-of-sync lock for dataset %(scope)s:%(name)s' % locals())
-                        if not dry_run:
-                            lock_obj = session.query(models.ReplicaLock)\
-                                              .filter_by(scope=scope, name=name, rse_id=rse_id).one()[0]
-                            __delete_lock_and_update_replica(lock=lock_obj)
-                        else:
-                            pass
-    
-                    check_volume(dataset['bytes'])
-                    break
+                if lock['rse_id'] != rse_id:
+                    continue
+                    
+                logging.debug('RSE: %(rse)s -- Deleting out-of-sync lock for dataset %(scope)s:%(name)s' % locals())
+                if not dry_run:
+                    lock_obj = session.query(models.ReplicaLock)\
+                                      .filter_by(scope=scope, name=name, rse_id=rse_id).one()[0]
+                    __delete_lock_and_update_replica(lock=lock_obj)
 
-        # Loop over file replicas with no rules and no locks
-        pass
+                check_volume(dataset['bytes'])
+                break
+
+        if check_volume.total_volume == 0.:
+            # No more containers to deal with
+            # Loop over file replicas with no rules and no locks
+            
+            files_to_delete = []
+            
+            if USE_DUMP_FOR_REPLICAS:
+                # ReplicaDumper.dump(rse, 'latest') <- crashes
+                dump_file = smart_open(ReplicaDumper.download(rse, date))
+                for line in dump_file:
+                    fields = (field.strip() for field in line.split('\t'))
+                    scope = fields[1]
+                    name = fields[2]
+                    size = int(fields[3])
+                    
+                    parent_dids = set()
+                    for d in list_all_parent_dids(scope, name, session=session):
+                        parent_dids.add('%s:%s' % (d['scope'], d['name']))
+
+                    if len(parent_dids & deferred_action) != 0:
+                        # This file is a part of a dataset with deferred action
+                        continue
+                        
+                    files_to_delete.append({'scope': scope, 'name': name})
+                    check_volume(size)
+            else:
+                # We probably don't need this option, and I don't know how to do this without a dump
+                pass
+                        
+            delete_replicas(rse_id, files_to_delete, session=session)
                     
     except TotalVolumeExceeded as exc:
         total_volume = exc.args[0]
         logging.info('RSE: %(rse)s -- Stopping decommissioning cycle because total volume to be deleted %(total_volume).2f TB > %(max_terabytes).2f TB' % locals())
+        return False
+
+    if check_volume.total_volume == 0. and len(deferred_action) == 0:
+        # Mark the RSE as decommissioning complete
+        if not dry_run:
+            try:
+                del_rse_attribute(rse_id, 'decommission', session=session)
+            except:
+                pass
+            else:
+                add_rse_attribute(rse_id, 'decommission', 'complete', session=session)
 
     return True
 
 
+def decommission_rses(rses=[], max_terabytes=None, dry_run=True):
+    rses_to_decommission = {}
+    
+    policy_dict = {'just_delete': JUST_DELETE, 'move': MOVE}
+    
+    # Loop over the RSEs with decommission attribute set
+    for rse in get_rses_with_attribute('decommission'):
+        if rse['decommission'] == 'complete':
+            continue
+            
+        policy = policy_dict[rse['decommission']]
+            
+        try:
+            rse_max_terabytes = rse['decommission_throttle']
+        except KeyError:
+            rse_max_terabytes = max_terabytes
+
+        rses_to_decommission[rse['rse']] = (policy, rse_max_terabytes)
+
+    # Override by the function argument
+    for entry in rses:
+        if type(entry) is tuple:
+            try:
+                rse, policy, rse_max_terabytes = entry
+            except ValueError:
+                rse, policy = entry
+                rse_max_terabytes = max_terabytes
+        else:
+            rse = entry
+            policy = JUST_DELETE
+            rse_max_terabytes = max_terabytes
+            
+        rses_to_decommission[rse] = (policy, rse_max_terabytes)
+        
+    logging.info('RSEs to decommission: %(rses_to_decommission)s' % locals())
+     
+    # Act on the RSEs
+    for rse, (policy, rse_max_terabytes) in rses_to_decommission.items():
+        decommission_rse(rse, policy, max_terabytes=rse_max_terabytes, dry_run=dry_run)
+
+        
 if __name__ == "__main__":
     parser = get_parser()
     args = parser.parse_args()
-
-    for rse in args.rse:
-        decommission_rse(rse, JUST_DELETE, max_terabytes=0.01, dry_run=(not args.run))
+    
+    decommission_rses(rses=args.rse, max_terabytes=args.max_terabytes, dry_run=(not args.run))
