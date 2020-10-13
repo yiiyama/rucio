@@ -21,6 +21,7 @@ from rucio.common.dumper.data_models import Replica as ReplicaDumper
 from rucio.common.dumper import smart_open
 from rucio.db.sqla.session import transactional_session
 from rucio.db.sqla import models
+from rucio.db.sqla.constants import DIDType, RuleState
 
 logging.basicConfig(stream=sys.stdout,
                     level=getattr(logging,
@@ -133,11 +134,12 @@ def mark_rse_as_done(rse_id, log_header='', dry_run=False, session=None):
         
         
 @transactional_session
-def delete_single_rse_rules(rse, limit_check, log_header='', dry_run=False, session=None):
+def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=False, session=None):
     """
     Delete rules with RSE expressions that consist only of the name of the given RSE.
     
     :param rse:          Name of the RSE.
+    :param rse_id:       RSE ID.
     :param limit_check:  LimitChecker instance
     :param session:      The database session.
     """
@@ -146,6 +148,8 @@ def delete_single_rse_rules(rse, limit_check, log_header='', dry_run=False, sess
         rule_id = rule['id']
         scope = rule['scope']
         name = rule['name']
+        did_type = rule['did_type']
+        state = rule['state']
 
         if move_dest is None:
             logging.debug('%(log_header)sDeleting rule %(rule_id)s for dataset %(scope)s:%(name)s' % locals())
@@ -154,12 +158,74 @@ def delete_single_rse_rules(rse, limit_check, log_header='', dry_run=False, sess
                 update_rule(rule_id, options, session=session)
         else:
             pass
-
-        limit_check.increment(rule=1)
         
+        # Increment the counters for throttling
+        if did_type == DIDType.FILE:
+            limit_check.increment(rules=1, replicas=1)
+
+        else:
+            num_datasets = 0
+            num_replicas = 0
+            
+            if state == RuleState.OK:
+                # This DID is a dataset/container and is complete at the RSE - count the files using DID association
+                # Counting performed recursively using a dids list (see core.did.list_files)
+                dids = [(scope, name, did_type)]
+
+                while dids:
+                    s, n, t = dids.pop()
+
+                    if t == DIDType.DATASET:
+                        query = session.query(models.DataIdentifierAssociation).\
+                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
+                            filter_by(scope=scope, name=name)
+
+                        num_datasets += 1
+                        num_replicas += query.count()
+
+                    else: # Neither a FILE nor a DATASET
+                        query = session.\
+                            query(models.DataIdentifierAssociation.child_scope,
+                                  models.DataIdentifierAssociation.child_name,
+                                  models.DataIdentifierAssociation.child_type).\
+                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
+                            filter_by(scope=s, name=n)
+
+                        for child_scope, child_name, child_type in query.yield_per(500):
+                            dids.append((child_scope, child_name, child_type))
+
+            else:
+                # This DID is a dataset/container and may not be complete; count the replicas directly
+                num_replicas = session.query(models.RSEFileAssociation).\
+                    filter_by(rse_id=rse_id, scope=scope, name=name).\
+                    count()
+
+                # Count the datasets - do we really want to go this far just to count?
+                dids = [(scope, name, did_type)]
+                num_datasets = 0
+
+                while dids:
+                    s, n, t = dids.pop()
+
+                    if t == DIDType.DATASET:
+                        num_datasets += 1
+
+                    else: # Neither a FILE nor a DATASET
+                        query = session.\
+                            query(models.DataIdentifierAssociation.child_scope,
+                                  models.DataIdentifierAssociation.child_name,
+                                  models.DataIdentifierAssociation.child_type).\
+                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
+                            filter_by(scope=s, name=n)
+
+                        for child_scope, child_name, child_type in query.yield_per(500):
+                            dids.append((child_scope, child_name, child_type))
+                
+            # Finally increment the counters
+            limit_check.increment(rules=1, datasets=num_datasets, replicas=num_replicas)
 
 @transactional_session
-def process_multi_rse_rules(rse, limit_check, log_header='', dry_run=False, session=None):
+def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=False, session=None):
     """
     Find rules with RSE expressions involving the given RSE among others.
     """
@@ -235,10 +301,10 @@ def decommission_rse_just_delete(rse, config, dry_run=False, session=None):
         set_rse_availability(rse_id, log_header=log_header, dry_run=dry_run, session=session)
 
         # 2. Delete rules where the RSE expression is the RSE itself
-        delete_single_rse_rules(rse, limit_check, log_header=log_header, dry_run=dry_run, session=session)
+        delete_single_rse_rules(rse, rse_id, limit_check, log_header=log_header, dry_run=dry_run, session=session)
 
         # 3. Deal with rules with more complicated RSE expressions
-        process_multi_rse_rules(rse, limit_check, log_header=log_header, dry_run=dry_run, session=session)
+        process_multi_rse_rules(rse, rse_id, limit_check, log_header=log_header, dry_run=dry_run, session=session)
 
         if limit_check.deleted_rules == 0:
             # 4. There were no rules to be deleted in this cycle - move on to final cleanup
