@@ -212,10 +212,10 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
                 
             num_replicas = 0
                 
-            for dataset in datasets:
+            for d in datasets:
                 query = session.query(models.DataIdentifierAssociation).\
                     with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
-                    filter_by(scope=scope, name=name)
+                    filter_by(scope=d['scope'], name=d['name'])
 
                 num_replicas += query.count()
                 
