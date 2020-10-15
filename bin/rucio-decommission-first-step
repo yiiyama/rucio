@@ -131,8 +131,47 @@ def mark_rse_as_done(rse_id, log_header='', dry_run=False, session=None):
             pass
         else:
             add_rse_attribute(rse_id, 'decommission', 'complete', session=session)
+
+            
+@read_session
+def __container_to_datasets(scope, name, max_depth=0, _depth=0, session=None):
+    """Flatten a container to a list of datasets.
+
+    ``scope`` should be a ``str`` with the scope of the container.
+
+    ``name`` should be a ``str`` with the name of the container.
+
+    ``max_depth`` should be a positive ``int`` to limit the recursion depth (default: no limit).
+
+    ``session`` should be an ``sqlalchemy.orm.session.Session``-like
+    object.  If not provided, one will be created automatically.
+
+    Returns a ``list`` of ``dict``s, each one representing a dataset
+    and having exactly two keys: 'scope' and 'name'.
+    """
+    
+    if max_depth > 0 and _depth > max_depth:
+        raise RuntimeError('exceeded maximum depth')
         
-        
+    datasets = []
+
+    query = session.query(models.DataIdentifierAssociation.child_scope,
+                          models.DataIdentifierAssociation.child_name,
+                          models.DataIdentifierAssociation.child_type).\
+        with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
+        filter(models.DataIdentifierAssociation.scope == scope,
+               models.DataIdentifierAssociation.name == name)
+
+    for child_scope, child_name, child_type in query.all():
+        if child_type == DIDType.CONTAINER:
+            datasets.extend(__container_to_datasets(child_scope, child_name, max_depth, _depth + 1, session))
+        elif row.child_type == DIDType.DATASET:
+            datasets.append((child_scope, child_name))
+            
+    # Remove duplicates from the returned list.
+    return [{'scope': d[0], 'name': d[1]} for d in set(datasets)]
+
+
 @transactional_session
 def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=False, session=None):
     """
@@ -164,65 +203,24 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
             limit_check.increment(rules=1, replicas=1)
 
         else:
-            num_datasets = 0
+            # This DID is a dataset or a container
+            # We count all the constituents regardless of the replication state to throttle on the maximum load
+            if did_type == DIDType.DATASET:
+                datasets = [{'scope': scope, 'name': name}]
+            elif did_type == DIDType.CONTAINER:
+                datasets = __container_to_datasets(scope, name, session=session)
+                
             num_replicas = 0
-            
-            if state == RuleState.OK:
-                # This DID is a dataset/container and is complete at the RSE - count the files using DID association
-                # Counting performed recursively using a dids list (see core.did.list_files)
-                dids = [(scope, name, did_type)]
+                
+            for dataset in datasets:
+                query = session.query(models.DataIdentifierAssociation).\
+                    with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
+                    filter_by(scope=scope, name=name)
 
-                while dids:
-                    s, n, t = dids.pop()
-
-                    if t == DIDType.DATASET:
-                        query = session.query(models.DataIdentifierAssociation).\
-                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
-                            filter_by(scope=scope, name=name)
-
-                        num_datasets += 1
-                        num_replicas += query.count()
-
-                    else: # Neither a FILE nor a DATASET
-                        query = session.\
-                            query(models.DataIdentifierAssociation.child_scope,
-                                  models.DataIdentifierAssociation.child_name,
-                                  models.DataIdentifierAssociation.child_type).\
-                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
-                            filter_by(scope=s, name=n)
-
-                        for child_scope, child_name, child_type in query.yield_per(500):
-                            dids.append((child_scope, child_name, child_type))
-
-            else:
-                # This DID is a dataset/container and may not be complete; count the replicas directly
-                num_replicas = session.query(models.RSEFileAssociation).\
-                    filter_by(rse_id=rse_id, scope=scope, name=name).\
-                    count()
-
-                # Count the datasets - do we really want to go this far just to count?
-                dids = [(scope, name, did_type)]
-                num_datasets = 0
-
-                while dids:
-                    s, n, t = dids.pop()
-
-                    if t == DIDType.DATASET:
-                        num_datasets += 1
-
-                    else: # Neither a FILE nor a DATASET
-                        query = session.\
-                            query(models.DataIdentifierAssociation.child_scope,
-                                  models.DataIdentifierAssociation.child_name,
-                                  models.DataIdentifierAssociation.child_type).\
-                            with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
-                            filter_by(scope=s, name=n)
-
-                        for child_scope, child_name, child_type in query.yield_per(500):
-                            dids.append((child_scope, child_name, child_type))
+                num_replicas += query.count()
                 
             # Finally increment the counters
-            limit_check.increment(rules=1, datasets=num_datasets, replicas=num_replicas)
+            limit_check.increment(rules=1, datasets=len(datasets), replicas=num_replicas)
 
 @transactional_session
 def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=False, session=None):
