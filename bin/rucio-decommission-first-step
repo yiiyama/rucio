@@ -3,25 +3,21 @@
 from __future__ import division
 from __future__ import print_function
 
-import logging
 import sys
-
+import logging
 import argparse
 
-from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse, get_rses_with_attribute
-from rucio.core.lock import get_dataset_locks
-from rucio.core.replica import list_datasets_per_rse, delete_replicas
-from rucio.core.did import list_all_parent_dids
+from sqlalchemy import or_, and_
+from sqlalchemy.sql import func
+
+from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse, add_rse_attribute, del_rse_attribute, get_rses_with_attribute
 from rucio.core.rule import list_rules, update_rule
 from rucio.core.rse_expression_parser import parse_expression
-
 from rucio.common import exception
 from rucio.common.config import config_get
-from rucio.common.dumper.data_models import Replica as ReplicaDumper
-from rucio.common.dumper import smart_open
-from rucio.db.sqla.session import transactional_session
 from rucio.db.sqla import models
-from rucio.db.sqla.constants import DIDType, RuleState
+from rucio.db.sqla.session import read_session, transactional_session
+from rucio.db.sqla.constants import DIDType
 
 logging.basicConfig(stream=sys.stdout,
                     level=getattr(logging,
@@ -92,13 +88,13 @@ class LimitChecker(object):
         self.deleted_datasets += datasets
         
         if self.config.max_replicas >= 0 and self.deleted_replicas >= self.config.max_replicas:
-            raise DecommissionigLimit('replicas', self.config.max_replicas, self.deleted_replicas)
+            raise DecommissionLimitExceeded('replicas', self.config.max_replicas, self.deleted_replicas)
         
         if self.config.max_rules >= 0 and self.deleted_rules >= self.config.max_rules:
-            raise DecommissionigLimit('rules', self.config.max_rules, self.deleted_rules)
+            raise DecommissionLimitExceeded('rules', self.config.max_rules, self.deleted_rules)
 
         if self.config.max_datasets >= 0 and self.deleted_datasets >= self.config.max_datasets:
-            raise DecommissionigLimit('datasets', self.config.max_datasets, self.deleted_datasets)
+            raise DecommissionLimitExceeded('datasets', self.config.max_datasets, self.deleted_datasets)
 
     def any(self):
         return self.deleted_replicas != 0 or self.deleted_rules != 0 or self.deleted_datasets != 0
@@ -146,30 +142,30 @@ def __container_to_datasets(scope, name, max_depth=0, _depth=0, session=None):
     ``session`` should be an ``sqlalchemy.orm.session.Session``-like
     object.  If not provided, one will be created automatically.
 
-    Returns a ``list`` of ``dict``s, each one representing a dataset
-    and having exactly two keys: 'scope' and 'name'.
+    Returns a ``list`` of ``tuples``s (scope, name).
     """
     
     if max_depth > 0 and _depth > max_depth:
         raise RuntimeError('exceeded maximum depth')
         
-    datasets = []
-
     query = session.query(models.DataIdentifierAssociation.child_scope,
                           models.DataIdentifierAssociation.child_name,
                           models.DataIdentifierAssociation.child_type).\
         with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
         filter(models.DataIdentifierAssociation.scope == scope,
-               models.DataIdentifierAssociation.name == name)
+               models.DataIdentifierAssociation.name == name,
+               or_(models.DataIdentifierAssociation.child_type == DIDType.CONTAINER,
+                   models.DataIdentifierAssociation.child_type == DIDType.DATASET))
+    
+    datasets = set()
 
     for child_scope, child_name, child_type in query.all():
         if child_type == DIDType.CONTAINER:
-            datasets.extend(__container_to_datasets(child_scope, child_name, max_depth, _depth + 1, session))
+            datasets.update(__container_to_datasets(child_scope, child_name, max_depth, _depth + 1, session))
         elif row.child_type == DIDType.DATASET:
-            datasets.append((child_scope, child_name))
+            datasets.add((child_scope, child_name))
             
-    # Remove duplicates from the returned list.
-    return [{'scope': d[0], 'name': d[1]} for d in set(datasets)]
+    return datasets
 
 
 @transactional_session
@@ -202,25 +198,24 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
         if did_type == DIDType.FILE:
             limit_check.increment(rules=1, replicas=1)
 
-        else:
+        elif did_type in [DIDType.DATASET, DIDType.CONTAINER]:
             # This DID is a dataset or a container
             # We count all the constituents regardless of the replication state to throttle on the maximum load
             if did_type == DIDType.DATASET:
-                datasets = [{'scope': scope, 'name': name}]
+                dataset_condition = [and_(models.DataIdentifier.scope == scope, models.DataIdentifier.name == name)]
             elif did_type == DIDType.CONTAINER:
-                datasets = __container_to_datasets(scope, name, session=session)
+                dataset_condition = []
+                for d in __container_to_datasets(scope, name, session=session):
+                    dataset_condition.append(and_(models.DataIdentifier.scope == d['scope'], models.DataIdentifier.name == d['name']))
                 
-            num_replicas = 0
-                
-            for d in datasets:
-                query = session.query(models.DataIdentifierAssociation).\
-                    with_hint(models.DataIdentifierAssociation, "INDEX(CONTENTS CONTENTS_PK)", 'oracle').\
-                    filter_by(scope=d['scope'], name=d['name'])
-
-                num_replicas += query.count()
+            num_files = session.query(func.sum(models.DataIdentifier.length)).\
+                filter(or_(*dataset_condition))
                 
             # Finally increment the counters
-            limit_check.increment(rules=1, datasets=len(datasets), replicas=num_replicas)
+            limit_check.increment(rules=1, datasets=len(dataset_condition), replicas=num_files)
+            
+        else:
+            raise NotImplementedError('delete_single_rse_rules can handle FILE, DATASET, and CONTAINER types at the moment.')
 
 @transactional_session
 def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=False, session=None):
@@ -235,51 +230,7 @@ def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
                 logging.warning('%(log_header)sNontrivial rule for dataset %(scope)s:%(name)s. Deferring action' % locals())
                 break
 
-                
-# @transactional_session
-# def delete_stale_locks(rse_id, limit_check, log_header='', dry_run=False, session=None):
-#     """
-#     Loop over the datasets with no rules and see if there are out-of-sync locks.
-#     This function should only be called once all the rules on the RSE are deleted
-#     (otherwise list_datasets_per_rse is too expensive).
-#     """
-    
-#     for dataset in list_datasets_per_rse(rse_id, session=session):
-#         scope = dataset['scope']
-#         name = dataset['name']
-        
-#         # Make sure this dataset does not have a rule at the RSE
-#         for rule in list_rules(filters={'scope': scope, 'name': name}, session=session):
-#             for rse_info in parse_expression(rule['rse_expression'], session=session):
-#                 if rse_info['id'] == rse_id:
-#                     raise exception.RucioException('delete_stale_locks should be called after all rules on the RSE are deleted.')
-                    
-#         # What should I do here?
 
-#         # Loop over locks for this dataset
-#         query = session.query(models.DatasetLock.rse_id,
-#                               models.DatasetLock.scope,
-#                               models.DatasetLock.name,
-#                               models.DatasetLock.rule_id,
-#                               models.DatasetLock.account,
-#                               models.DatasetLock.state,
-#                               models.DatasetLock.length,
-#                               models.DatasetLock.bytes,
-#                               models.DatasetLock.accessed_at)\
-#             .filter_by(scope=scope, name=name, rse_id=rse_id)
-
-#             logging.debug('RSE: %(rse)s -- Deleting out-of-sync lock for dataset %(scope)s:%(name)s' % locals())
-#             if not dry_run:
-#                 lock_obj = session.query(models.ReplicaLock)\
-#                                   .filter_by(scope=scope, name=name, rse_id=rse_id).one()[0]
-#                 __delete_lock_and_update_replica(lock=lock_obj)
-
-#             check_volume(dataset['bytes'])
-    
-#     for dataset in datasets_with_no_rule:
-
-#             break
-            
 @transactional_session    
 def decommission_rse_just_delete(rse, config, dry_run=False, session=None):
     try:
