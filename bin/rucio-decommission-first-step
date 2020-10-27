@@ -84,9 +84,9 @@ class LimitChecker(object):
         self.deleted_datasets = 0
         
     def increment(self, replicas=0, rules=0, datasets=0):
-        self.deleted_replicas += replicas
-        self.deleted_rules += rules
-        self.deleted_datasets += datasets
+        self.deleted_replicas += (replicas if replicas else 0)
+        self.deleted_rules += (rules if rules else 0)
+        self.deleted_datasets += (datasets if datasets else 0)
         
         if self.config.max_replicas >= 0 and self.deleted_replicas >= self.config.max_replicas:
             raise DeletionLimitExceeded('replicas', self.config.max_replicas, self.deleted_replicas)
@@ -165,7 +165,7 @@ def __container_to_datasets(scope, name, max_depth=0, _depth=0, session=None):
     for child_scope, child_name, child_type in query.all():
         if child_type == DIDType.CONTAINER:
             datasets.update(__container_to_datasets(child_scope, child_name, max_depth, _depth + 1, session))
-        elif row.child_type == DIDType.DATASET:
+        elif child_type == DIDType.DATASET:
             datasets.add((child_scope, child_name))
             
     return datasets
@@ -205,11 +205,16 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
                 dataset_condition = [and_(models.DataIdentifier.scope == scope, models.DataIdentifier.name == name)]
             elif did_type == DIDType.CONTAINER:
                 dataset_condition = []
-                for d in __container_to_datasets(scope, name, session=session):
-                    dataset_condition.append(and_(models.DataIdentifier.scope == d['scope'], models.DataIdentifier.name == d['name']))
+                for s, n in __container_to_datasets(scope, name, session=session):
+                    dataset_condition.append(
+                        and_(models.DataIdentifier.scope == s, models.DataIdentifier.name == n)
+                    )
                 
-            num_files = session.query(func.sum(models.DataIdentifier.length)).\
+            logging.debug('Querying number of files')
+            num_files, = session.query(func.sum(models.DataIdentifier.length)).\
                 filter(or_(*dataset_condition)).one()
+            logging.debug('Done')
+            logging.debug(num_files)
                 
             # Finally increment the counters
             limit_check.increment(rules=1, datasets=len(dataset_condition), replicas=num_files)
@@ -224,11 +229,19 @@ def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
     Find rules with RSE expressions involving the given RSE among others.
     """
     
+    # Do we really want to loop over all rules and parse every single RSE expression? Is there not a better way?
     for rule in list_rules(session=session):
-        for rse_info in parse_expression(rule['rse_expression'], session=session):
+        rse_expression = rule['rse_expression']
+        if rse_expression == rse:
+            continue
+            
+        for rse_info in parse_expression(rse_expression, session=session):
             if rse_info['rse'] == rse:
+                scope = rule['scope']
+                name = rule['name']
                 # The rse_expression for this rule contains the current RSE among others
                 logging.warning('%(log_header)sNontrivial rule for dataset %(scope)s:%(name)s. Deferring action' % locals())
+                logging.debug('%(log_header)sRSE expression is "%(rse_expression)s"' % locals())
                 break
 
 
