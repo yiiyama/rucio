@@ -4,6 +4,8 @@ from __future__ import division
 from __future__ import print_function
 
 import sys
+import re
+from datetime import datetime
 import logging
 import argparse
 
@@ -43,24 +45,26 @@ def get_parser():
 
 class DecommissioningConfig(object):
     # Profile options
-    JUST_DELETE, MOVE = range(2)
+    _profiles = JUST_DELETE, MOVE = range(2)
+    _profile_names = ['just_delete', 'move']
 
     def __init__(self, profile, **kwargs):
-        if profile == 'just_delete':
-            self.profile = self.JUST_DELETE
-        elif profile == 'move':
-            self.profile = self.MOVE
-        else:
+        if profile in self._profiles:
             self.profile = profile
+        else:
+            try:
+                # Profile given by name?
+                self.profile = self._profile_names.index(profile.lower())
+            except:
+                raise exception.ConfigurationError('Invalid profile specified for DecommissioningConfig')
         
         if self.profile == self.JUST_DELETE:
-            try:
-                self.max_replicas = kwargs['max_replicas']
-                self.max_rules = kwargs['max_rules']
-                self.max_datasets = kwargs['max_datasets']
-            except KeyError:
-                raise exception.ConfigurationError('Need max_replicas, max_rules, max_datasets for profile just_delete')
-                
+            # Set max_replicas, max_rules, and max_datasets possibly from kwargs (default -1)
+            for var in ['replicas', 'rules', 'datasets']:
+                try:
+                    setattr(self, 'max_%s' % var, kwargs['max_%s' % var])
+                except KeyError:
+                    setattr(self, 'max_%s' % var, -1)
         else:
             pass
 
@@ -83,10 +87,18 @@ class LimitChecker(object):
         self.deleted_rules = 0
         self.deleted_datasets = 0
         
+        self._local_deleted_replicas = 0
+        self._local_deleted_rules = 0
+        self._local_deleted_datasets = 0
+        
     def increment(self, replicas=0, rules=0, datasets=0):
         self.deleted_replicas += (replicas if replicas else 0)
         self.deleted_rules += (rules if rules else 0)
         self.deleted_datasets += (datasets if datasets else 0)
+        
+        self._local_deleted_replicas += (replicas if replicas else 0)
+        self._local_deleted_rules += (rules if rules else 0)
+        self._local_deleted_datasets += (datasets if datasets else 0)
         
         if self.config.max_replicas >= 0 and self.deleted_replicas >= self.config.max_replicas:
             raise DeletionLimitExceeded('replicas', self.config.max_replicas, self.deleted_replicas)
@@ -98,7 +110,19 @@ class LimitChecker(object):
             raise DeletionLimitExceeded('datasets', self.config.max_datasets, self.deleted_datasets)
 
     def any(self):
-        return self.deleted_replicas != 0 or self.deleted_rules != 0 or self.deleted_datasets != 0
+        return self.deleted_replicas + self.deleted_rules + self.deleted_datasets != 0
+    
+    def start_local_count(self):
+        """Local count within some code block"""
+        self._local_deleted_replicas = 0
+        self._local_deleted_rules = 0
+        self._local_deleted_datasets = 0
+        
+    def local_any(self, reset=True):
+        result = (self._local_deleted_replicas + self._local_deleted_rules + self._local_deleted_datasets != 0)
+        if reset:
+            self.start_local_count()
+        return result
     
 
 @transactional_session
@@ -181,8 +205,14 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
     :param limit_check:  LimitChecker instance
     :param session:      The database session.
     """
+    
+    limit_check.start_local_count()
 
     for rule in list_rules(filters={'rse_expression': rse}, session=session):
+        if rule['expires_at'] is not None and rule['expires_at'] <= datetime.utcnow():
+            # This rule is already bound for deletion
+            continue
+        
         rule_id = rule['id']
         scope = rule['scope']
         name = rule['name']
@@ -221,6 +251,9 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
             
         else:
             raise NotImplementedError('delete_single_rse_rules can handle FILE, DATASET, and CONTAINER types at the moment.')
+            
+    if not limit_check.local_any(reset=True):
+        logging.info('%(log_header)sFound no trivial rule to delete' % locals())
 
             
 @transactional_session
@@ -228,6 +261,8 @@ def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
     """
     Find rules with RSE expressions involving the given RSE among others.
     """
+    
+    limit_check.start_local_count()
     
     # Do we really want to loop over all rules and parse every single RSE expression? Is there not a better way?
     for rule in list_rules(session=session):
@@ -242,7 +277,11 @@ def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
                 # The rse_expression for this rule contains the current RSE among others
                 logging.warning('%(log_header)sNontrivial rule for dataset %(scope)s:%(name)s. Deferring action' % locals())
                 logging.debug('%(log_header)sRSE expression is "%(rse_expression)s"' % locals())
+                limit_check.increment(rules=1) # Otherwise we'll mark this RSE as decommission=complete
                 break
+                
+    if not limit_check.local_any(reset=True):
+        logging.info('%(log_header)sFound no nontrivial rule to delete' % locals())
 
 
 @transactional_session    
@@ -261,16 +300,21 @@ def decommission_rse_just_delete(rse, config, dry_run=False, session=None):
         # 1. Set RSE availability and greedyDeletion attributes
         logging.info('%(log_header)sSetting RSE availability flags' % locals())
         set_rse_availability(rse_id, log_header=log_header, dry_run=dry_run, session=session)
+        
+        # 2. Set RSE 'decommission' attribute to 'just_delete'
+        logging.info('%(log_header)sSetting RSE attribute decommission=just_delete' % locals())
+        if not dry_run:
+            add_rse_attribute(rse_id, 'decommission', 'just_delete', session=session)
 
-        # 2. Delete rules where the RSE expression is the RSE itself
+        # 3. Delete rules where the RSE expression is the RSE itself
         logging.info('%(log_header)sDeleting trivial rules on the RSE' % locals())
         delete_single_rse_rules(rse, rse_id, limit_check, log_header=log_header, dry_run=dry_run, session=session)
 
-        # 3. Deal with rules with more complicated RSE expressions
+        # 4. Deal with rules with more complicated RSE expressions
         logging.info('%(log_header)sProcessing nontrivial rules' % locals())
         process_multi_rse_rules(rse, rse_id, limit_check, log_header=log_header, dry_run=dry_run, session=session)
 
-        if limit_check.deleted_rules == 0:
+        if not limit_check.any():
             # 4. There were no rules to be deleted in this cycle - move on to final cleanup
             # delete_locks_with_no_rule()
             # delete_replicas_with_no_locks()
@@ -296,41 +340,56 @@ def decommission_rse(rse, config, dry_run=False, session=None):
     :param rse:      Name of the RSE.
     :param session:  The database session.
     """
-
     if config.profile == DecommissioningConfig.JUST_DELETE:
-        decommission_rse_just_delete(rse, config, dry_run=dry_run, session=session)
+        return decommission_rse_just_delete(rse, config, dry_run=dry_run, session=session)
 
     elif config.profile == DecommissioningConfig.MOVE:
-        pass
-
-    return True
+        return False
 
 
+@read_session
 def decommission_rses(rses=[],
                       profile=DecommissioningConfig.JUST_DELETE,
                       max_replicas=-1,
                       max_rules=-1,
                       max_datasets=-1,
-                      dry_run=True):
+                      dry_run=True,
+                      session=None):
 
     configs = {}
     
     # Loop over the RSEs with decommission attribute set
-    for rse in get_rses_with_attribute('decommission'):
-        if rse['decommission'] == 'complete':
-            continue
-                     
-        rse_profile = rse['decommission']
-        config_args = {}
-            
-        if rse_profile == 'just_delete':
-            for v in ['replicas', 'rules', 'datasets']:
-                try:
-                    config_args['max_%s' % v] = rse['decommission_%s_per_run' % v]
-                except KeyError:
-                    config_args['max_%s' % v] = -1
+    query = session.query(models.RSE, models.RSEAttrAssociation).\
+        join(models.RSEAttrAssociation).\
+        filter(models.RSEAttrAssociation.key == 'decommission')
+    
+    delete_limits = {}
 
-        configs[rse['rse']] = DecommissioningConfig(rse_profile, **config_args)
+    for rse, attr in query.all():
+        if attr.key == 'decommission':
+            # RSE has the decommission flag set - flag value is either the profile string or 'complete'
+            if attr.value == 'complete':
+                continue
+            
+            # If a profile string is given, create a configuration
+            configs[rse.rse] = DecommissioningConfig(attr.value)
+
+        elif attr.key.startswith('decommission_'):
+            # Attributes 'decommission_*_per_run' sets the deletion limits
+            matches = re.match('decommission_(replicas|rules|datasets)_per_run', attr.key)
+            if matches is None:
+                continue
+                     
+            delete_limits[(rse.rse, matches.group(1))] = int(attr.value)
+        
+    # Attach the deletion limits to the configurations
+    for (rse, var), limit in delete_limits.items():
+        try:
+            setattr(configs[rse], 'max_%s' % var, limit)
+        except KeyError:
+            # Deletion limit was set but the RSE is not marked for decommissioning
+            logging.warning('RSE %(rse)s has attribute decommission_%(var)s_per_run set, but is not marked for decommissioning' % locals())
+            pass
 
     # Override by the function argument
     for rse in rses:
@@ -346,7 +405,7 @@ def decommission_rses(rses=[],
      
     # Act on the RSEs
     for rse, config in configs.items():
-        decommission_rse(rse, config, dry_run=dry_run)
+        decommission_rse(rse, config, dry_run=dry_run, session=session)
 
         
 if __name__ == "__main__":
