@@ -218,8 +218,10 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
         name = rule['name']
         did_type = rule['did_type']
         state = rule['state']
+        
+        type_str = str(did_type).lower()
 
-        logging.debug('%(log_header)sDeleting rule %(rule_id)s for dataset %(scope)s:%(name)s' % locals())
+        logging.debug('%(log_header)sDeleting rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s' % locals())
         if not dry_run:
             options = {'lifetime': 0, 'state': 'suspended', 'cancel_requests': True}
             update_rule(rule_id, options, session=session)
@@ -239,15 +241,18 @@ def delete_single_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
                     dataset_condition.append(
                         and_(models.DataIdentifier.scope == s, models.DataIdentifier.name == n)
                     )
+
+            num_datasets = len(dataset_condition)
+            
+            num_files = 0
+            if num_datasets != 0:
+                num_files, = session.query(func.sum(models.DataIdentifier.length)).\
+                    filter(or_(*dataset_condition)).one()
                 
-            logging.debug('Querying number of files')
-            num_files, = session.query(func.sum(models.DataIdentifier.length)).\
-                filter(or_(*dataset_condition)).one()
-            logging.debug('Done')
-            logging.debug(num_files)
-                
+            logging.debug('%(log_header)s%(num_datasets)s datasets and %(num_files)s files in this DID' % locals())
+
             # Finally increment the counters
-            limit_check.increment(rules=1, datasets=len(dataset_condition), replicas=num_files)
+            limit_check.increment(rules=1, datasets=num_datasets, replicas=num_files)
             
         else:
             raise NotImplementedError('delete_single_rse_rules can handle FILE, DATASET, and CONTAINER types at the moment.')
@@ -270,7 +275,12 @@ def process_multi_rse_rules(rse, rse_id, limit_check, log_header='', dry_run=Fal
         if rse_expression == rse:
             continue
             
-        for rse_info in parse_expression(rse_expression, session=session):
+        try:
+            rse_info_list = parse_expression(rse_expression, session=session)
+        except exception.InvalidRSEExpression:
+            continue
+            
+        for rse_info in rse_info_list:
             if rse_info['rse'] == rse:
                 scope = rule['scope']
                 name = rule['name']
