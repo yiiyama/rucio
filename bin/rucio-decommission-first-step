@@ -109,7 +109,7 @@ def set_rse_availability(rse_id, log_header='', dry_run=False, session=None):
     result = session.query(models.RSE).filter_by(id=rse_id).one()
     # hard-coding potentially changeable mapping..! Check rucio.core.rse
     read, write, delete = 4, 2, 1
-    availability = (read | ~write | delete)
+    availability = (read | delete)
     if result['availability'] != availability:
         logging.debug('%(log_header)supdating RSE availability to %(availability)s' % locals())
         parameters = {'availability_read': True, 'availability_write': False, 'availability_delete': True}
@@ -117,7 +117,7 @@ def set_rse_availability(rse_id, log_header='', dry_run=False, session=None):
             update_rse(rse_id, parameters, session=session)
 
     # Check the RSE greedyDeletion attribute (in the RSEAttrAssociation table)
-    current = get_rse_attribute('greedyDeletion', rse_id=rse_id, session=session)
+    current = get_rse_attribute('greedyDeletion', rse_id=rse_id, session=session)[0]
     if current != True:
         logging.debug('%(log_header)supdating attribute greedyDeletion to True' % locals())
         if not dry_run:
