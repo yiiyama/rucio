@@ -105,19 +105,24 @@ def set_rse_availability(rse_id, log_header='', dry_run=False, session=None):
     Get the RSE ready for decommissioning (availability and greedyDeletion)
     """
     
-    # Check the RSE attributes
-    update_dict = {}
-    for attr, value in [('availability_read', True), ('availability_write', False), ('availability_delete', True), ('greedyDeletion', True)]:
-        current = get_rse_attribute(attr, rse_id=rse_id, session=session)
-        if current == value:
-            continue
-            
-        logging.debug('%(log_header)supdating attribute %(attr)s (%(current)s => %(value)s)' % locals())
-        update_dict[attr] = value
+    # Check the RSE availability attributes (in the RSE table)
+    result = session.query(models.RSE).filter_by(id=rse_id).one()
+    # hard-coding potentially changeable mapping..! Check rucio.core.rse
+    read, write, delete = 4, 2, 1
+    availability = (read | ~write | delete)
+    if result['availability'] != availability:
+        logging.debug('%(log_header)supdating RSE availability to %(availability)s' % locals())
+        parameters = {'availability_read': True, 'availability_write': False, 'availability_delete': True}
+        if not dry_run:
+            update_rse(rse_id, parameters, session=session)
 
-    # Update the attributes
-    if update_dict and not dry_run:
-        update_rse(rse_id, update_dict, session=session)
+    # Check the RSE greedyDeletion attribute (in the RSEAttrAssociation table)
+    current = get_rse_attribute('greedyDeletion', rse_id=rse_id, session=session)
+    if current != True:
+        logging.debug('%(log_header)supdating attribute greedyDeletion to True' % locals())
+        if not dry_run:
+            del_rse_attribute(rse_id, 'greedyDeletion', session=session) 
+            add_rse_attribute(rse_id, 'greedyDeletion', True, session=session)
 
         
 @transactional_session
@@ -382,7 +387,7 @@ def decommission_rse(rse, profile, limit_check, dry_run=False, session=None):
 JUST_DELETE, MOVE = range(2)
 PROFILES = ['just_delete', 'move']
 
-@read_session
+@transactional_session
 def decommission_rses(rses=[],
                       profile=JUST_DELETE,
                       max_replicas=-1,
