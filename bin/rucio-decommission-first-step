@@ -111,17 +111,20 @@ def set_rse_availability(rse_id, log_header='', dry_run=False, session=None):
     read, write, delete = 4, 2, 1
     availability = (read | delete)
     if result['availability'] != availability:
-        logging.debug('%(log_header)supdating RSE availability to %(availability)s' % locals())
+        logging.debug('%(log_header)supdating RSE availability to read !write delete' % locals())
         parameters = {'availability_read': True, 'availability_write': False, 'availability_delete': True}
         if not dry_run:
             update_rse(rse_id, parameters, session=session)
 
     # Check the RSE greedyDeletion attribute (in the RSEAttrAssociation table)
-    current = get_rse_attribute('greedyDeletion', rse_id=rse_id, session=session)[0]
+    try:
+        current = get_rse_attribute('greedyDeletion', rse_id=rse_id, session=session)[0]
+    except IndexError:
+        current = False
+        
     if current != True:
         logging.debug('%(log_header)supdating attribute greedyDeletion to True' % locals())
         if not dry_run:
-            del_rse_attribute(rse_id, 'greedyDeletion', session=session) 
             add_rse_attribute(rse_id, 'greedyDeletion', True, session=session)
 
         
