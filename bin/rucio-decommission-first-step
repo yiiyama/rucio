@@ -56,7 +56,7 @@ class DeletionLimitExceeded(Exception):
         self.count = count
         
     def __str__(self):
-        return 'number of deleted %s %s reached the limit %s' % (self.what, self.count, self.limit)
+        return 'number of deleted %s=%s reached the limit=%s' % (self.what, self.count, self.limit)
 
 
 class LimitChecker(object):
@@ -217,7 +217,7 @@ def __count_rule(limit_check, rule, logger, session=None):
                 filter(or_(*dataset_condition)).one()
 
         logger.debug('DID contains %(num_datasets)s datasets and %(num_files)s files' % locals())
-
+        
         # Finally increment the counters
         limit_check.increment(rules=1, datasets=num_datasets, replicas=num_files)
         
@@ -275,7 +275,7 @@ def delete_single_rse_rules(rse, rse_id, limit_check, dry_run=False, session=Non
         logger.debug('Deleting rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s' % locals())
         if not dry_run:
             options = {'lifetime': 0, 'state': 'suspended', 'cancel_requests': True}
-            #update_rule(rule.id, options, session=session)
+            update_rule(rule.id, options, session=session)
             
         __count_rule(limit_check, rule, logger, session=session)
             
@@ -447,7 +447,7 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
     logger = logging.getLogger('decommissioning.%(rse)s' % locals())
     
     deferred_action = 0
-
+    
     try:
         # 1. Set RSE availability and greedyDeletion attributes
         logger.info('Setting RSE availability flags')
@@ -472,10 +472,10 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
                 # delete_locks_with_no_rule()
                 # delete_replicas_with_no_locks()
                 pass
-    
+            
     except DeletionLimitExceeded as exc:
         reason = str(exc)
-        logger.info('Stopping decommissioning cycle because %(reason)' % locals())
+        logger.info('Stopping decommissioning cycle because %(reason)s' % locals())
         return False
 
     if limit_check.any():
@@ -489,7 +489,6 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
 
         cache_path = CACHE_DIR + ('/replicas_%(rse)s.pkl' % locals())
         if os.path.exists(cache_path):
-        if False:
             # There is a cached list of replicas from a previous scan. Let's check those replicas first
             replicas_exist = check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=dry_run, session=session)
             if replicas_exist:
