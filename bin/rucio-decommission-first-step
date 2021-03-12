@@ -278,9 +278,10 @@ def delete_single_rse_rules(rse, rse_id, limit_check, dry_run=False, session=Non
             update_rule(rule.id, options, session=session)
             
         __count_rule(limit_check, rule, logger, session=session)
-            
+
+    num_rules = limit_check.local_deleted_rules        
+
     if limit_check.local_any():
-        num_rules = limit_check.local_deleted_rules
         logger.info('Deleted %(num_rules)s rules' % locals())
     else:
         logger.info('Found no trivial rule to delete')
@@ -456,7 +457,7 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
         # 2. Set RSE 'decommission' attribute to 'just_delete'
         logger.info('Setting RSE attribute decommission=just_delete')
         if not dry_run:
-            add_rse_attribute(rse_and_id, 'decommission', 'just_delete', session=session)
+            add_rse_attribute(rse_id, 'decommission', 'just_delete', session=session)
 
         # 3. Delete rules where the RSE expression is the RSE itself
         logger.info('Deleting trivial rules on the RSE')
