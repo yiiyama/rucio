@@ -34,6 +34,9 @@ logging.basicConfig(stream=sys.stdout,
 # TBD - we should cache the RSEFileAssociation scan results and redo the scan only when all cached replicas are gone
 CACHE_DIR = '/tmp'
 
+# Decommissioning profiles
+JUST_DELETE, MOVE = range(2)
+PROFILES = ['just_delete', 'move']
 
 def get_parser():
     """
@@ -44,6 +47,7 @@ def get_parser():
     parser.add_argument('--max-replicas', dest='max_replicas', action='store', type=int, default=-1, help='Maximum number of replicas to delete per cycle.')
     parser.add_argument('--max-rules', dest='max_rules', action='store', type=int, default=-1, help='Maximum number of rules to delete per cycle.')
     parser.add_argument('--max-datasets', dest='max_datasets', action='store', type=int, default=-1, help='Maximum number of datasets to delete per cycle.')
+    parser.add_argument('--force', dest='force', action='store_true', help='Force decommissioning under the given profile.')
     #parser.add_argument('--dry-run', action='store_true', help='Dry run')
     parser.add_argument('--run', action='store_true', help='Actually run')
     return parser
@@ -388,8 +392,13 @@ def check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=Fals
 
     with open(cache_path, 'rb') as source:
         replicas = pickle.load(source)
-
+        
     num_cached_replicas = len(replicas)
+        
+    if num_cached_replicas == 0:
+        logger.info('There are no cached replicas. RSE has likely been emptied in the previous run.')
+        return False
+
     logger.info('Checking if %(num_cached_replicas)s replicas we found in the previous scan are still there' % locals())
 
     replicas_condition = []
@@ -438,13 +447,7 @@ def check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=Fals
 
 
 @transactional_session    
-def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
-    try:
-        rse_id = get_rse_id(rse, session=session, include_deleted=False)
-    except exception.RSENotFound:
-        logger.warning('RSE %(rse)s not found' % locals())
-        return False
-    
+def decommission_rse_just_delete(rse, rse_id, limit_check, dry_run=False, session=None):
     logger = logging.getLogger('decommissioning.%(rse)s' % locals())
     
     deferred_action = 0
@@ -454,22 +457,17 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
         logger.info('Setting RSE availability flags')
         set_rse_availability(rse, rse_id, dry_run=dry_run, session=session)
         
-        # 2. Set RSE 'decommission' attribute to 'just_delete'
-        logger.info('Setting RSE attribute decommission=just_delete')
-        if not dry_run:
-            add_rse_attribute(rse_id, 'decommission', 'just_delete', session=session)
-
-        # 3. Delete rules where the RSE expression is the RSE itself
+        # 2. Delete rules where the RSE expression is the RSE itself
         logger.info('Deleting trivial rules on the RSE')
         delete_single_rse_rules(rse, rse_id, limit_check, dry_run=dry_run, session=session)
         
         if not limit_check.any():
-            # # 4. Deal with rules with more complicated RSE expressions
+            # # 3. Deal with rules with more complicated RSE expressions
             # logger.info('Processing nontrivial rules' % locals())
             # process_multi_rse_rules(rse, rse_id, limit_check, dry_run=dry_run, session=session)
 
             if not limit_check.any():
-                # # 5. There were no rules to be deleted in this cycle - move on to final cleanup
+                # # 4. There were no rules to be deleted in this cycle - move on to final cleanup
                 # delete_locks_with_no_rule()
                 # delete_replicas_with_no_locks()
                 pass
@@ -510,12 +508,15 @@ def decommission_rse_just_delete(rse, limit_check, dry_run=False, session=None):
 
 
 @transactional_session
-def decommission_rse(rse, profile, limit_check, dry_run=False, session=None):
+def decommission_rse(rse, profile, limit_check, force=False, dry_run=False, session=None):
     """
     Set RSE attributes for decommissioning (read=True, write=False, delete=True).
 
-    :param rse:      Name of the RSE.
-    :param session:  The database session.
+    :param rse:         Name of the RSE.
+    :param profile:     Decommissioning profile identifier.
+    :param limit_check: A LimitChecker instance.
+    :param force:       If True, ignore the RSE attribute 'decommission'.
+    :param session:     The database session.
     """
 
     # Define an RSE-specific logger for convenience
@@ -526,16 +527,39 @@ def decommission_rse(rse, profile, limit_check, dry_run=False, session=None):
     handler.setFormatter(logging.Formatter('%(asctime)s\t%(process)d\t%(levelname)s\tRSE={}: %(message)s'.format(rse)))
     logger.addHandler(handler)
     
+    # Retrieve the RSE ID
+    try:
+        rse_id = get_rse_id(rse, session=session, include_deleted=False)
+    except exception.RSENotFound:
+        logger.warning('RSE %(rse)s not found' % locals())
+        return False
+    
+    # Check the current decommissioning profile. This could be different from `profile` if the RSE was specified from command line
+    profile_name = PROFILES[profile]
+
+    logger.debug('Checking RSE attribute "decommission"')    
+    try:
+        current_state = get_rse_attribute('decommission', rse_id=rse_id, session=session)[0]
+        
+        if current_state != profile_name:
+            if force:
+                logger.warning('Current decommissioning state (profile) is "%(current_state)s"; switching to "%(profile_name)s" because force=True' % locals())
+            else:
+                logger.error('Current decommissioning state (profile) is "%(current_state)s"; aborting decommissioning with profile "%(profile_name)s"' % locals())
+                return False
+            
+    except IndexError:
+        logger.info('Setting RSE attribute decommission=%(profile_name)s' % locals())
+        if not dry_run:
+            add_rse_attribute(rse_id, 'decommission', profile_name, session=session)
+
+    # Now run the decommissioning function according to the profile
     if profile == JUST_DELETE:
-        return decommission_rse_just_delete(rse, limit_check, dry_run=dry_run, session=session)
+        return decommission_rse_just_delete(rse, rse_id, limit_check, dry_run=dry_run, session=session)
 
     elif profile == MOVE:
         return False
     
-
-# Decommissioning profiles
-JUST_DELETE, MOVE = range(2)
-PROFILES = ['just_delete', 'move']
 
 @transactional_session
 def decommission_rses(rses=[],
@@ -543,6 +567,7 @@ def decommission_rses(rses=[],
                       max_replicas=-1,
                       max_rules=-1,
                       max_datasets=-1,
+                      force=False,
                       dry_run=True,
                       session=None):
 
@@ -573,7 +598,7 @@ def decommission_rses(rses=[],
     # Act on the RSEs
     for rse, profile in profiles.items():
         limit_check = LimitChecker(max_rules, max_datasets, max_replicas)
-        decommission_rse(rse, profile, limit_check, dry_run=dry_run, session=session)
+        decommission_rse(rse, profile, limit_check, force=force, dry_run=dry_run, session=session)
 
         
 if __name__ == "__main__":
@@ -584,5 +609,6 @@ if __name__ == "__main__":
                       max_replicas=args.max_replicas,
                       max_rules=args.max_rules,
                       max_datasets=args.max_datasets,
+                      force=args.force,
                       dry_run=(not args.run))
 
