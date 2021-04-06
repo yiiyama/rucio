@@ -18,10 +18,11 @@ from sqlalchemy.orm.exc import NoResultFound
 from rucio.core.rse import get_rse_id, get_rse_attribute, update_rse, add_rse_attribute, del_rse_attribute, get_rses_with_attribute
 from rucio.core.rule import update_rule
 from rucio.core.rse_expression_parser import parse_expression
+from rucio.core.lock import get_dataset_locks_by_rse_id
 from rucio.common import exception
 from rucio.common.config import config_get
 from rucio.db.sqla import models
-from rucio.db.sqla.session import read_session, transactional_session
+from rucio.db.sqla.session import read_session, stream_session, transactional_session
 from rucio.db.sqla.constants import DIDType
 
 logging.basicConfig(stream=sys.stdout,
@@ -151,6 +152,99 @@ def mark_rse_as_done(rse, rse_id, dry_run=False, session=None):
         add_rse_attribute(rse_id, 'decommission', 'complete', session=session)
 
 
+# Perhaps the following function can be moved to core.rule with some generalization? (Y.I. 02.04.2021)
+@stream_session
+def get_dataset_rules_by_rse_id(rse_id, selection=None, session=None):
+    query = session.query(models.ReplicationRule).\
+        with_hint(models.DatasetLock, "INDEX(DATASET_LOCKS DATASET_LOCKS_RSE_ID_IDX)", 'oracle').\
+        join(models.DatasetLock, models.ReplicationRule.id == models.DatasetLock.rule_id).\
+        filter(models.DatasetLock.rse_id == rse_id)
+    
+    if type(selection) is tuple:
+        query = query.filter(*selection)
+    elif selection is not None:
+        query = query.filter(selection)
+    
+    for rule in query.yield_per(5):
+        yield rule.to_dict()
+
+
+@stream_session
+def get_file_rules_by_rse_id(rse_id, selection=None, cache_path=None, session=None):
+    """
+    Perform a full scan of the RSEFileAssociation table to collect all replicas at the RSE. To be executed sparingly,
+    only when we have no more rules to delete.
+    
+    :param rse_id: RSE ID.
+    :param cache_path: None or the path of the cache pickle file.
+    """
+
+    query = session.query(models.ReplicationRule).\
+        join(models.ReplicaLock, models.ReplicationRule.id == models.ReplicaLock.rule_id).\
+        filter(models.ReplicaLock.rse_id == rse_id)
+
+    if type(selection) is tuple:
+        query = query.filter(*selection)
+    elif selection is not None:
+        query = query.filter(selection)
+
+    if cache_path is not None:
+        rules = []
+        for rule in query.yield_per(100):
+            rules.append(rule.to_dict())
+
+        with open(cache_path, 'wb') as out:
+            pickle.dump(rules, out, protocol=pickle.HIGHEST_PROTOCOL)
+
+        for rule in rules:
+            yield rule
+
+    else:
+        for rule in query.yield_per(5):
+            yield rule.to_dict()
+
+
+@stream_session
+def get_file_rules_from_replicas(replicas, batch_size=1000, session=None):
+    """
+    Look up the rules locking the replicas.
+
+    :param replicas: List of replicas (dict).
+    :param batch_size: Optional batch size for lookup query.
+    """
+
+    conditions = []
+
+    for replica in replicas:
+        conditions.append(and_(
+            models.ReplicaLock.scope == replica['scope'],
+            models.ReplicaLock.name == replica['name'],
+            models.ReplicaLock.rse_id == replica['rse_id']
+        ))
+
+    if batch_size <= 0:
+        batch_size = len(conditions)
+        
+    begin = 0
+    end = batch_size
+
+    while begin < len(conditions):
+        query = session.query(models.ReplicationRule).\
+            with_hint(models.ReplicaLock, "INDEX(LOCKS LOCKS_PK)", 'oracle').\
+            join(models.ReplicaLock, models.ReplicationRule.id == models.ReplicaLock.rule_id).\
+            filter(or_(*conditions[begin:end]))
+
+        counts = 0
+        for row in query.yield_per(100):
+            counts += 1
+            yield row.to_dict()
+
+        print(counts, 'rows from', len(conditions[begin:end]))
+
+        begin += end
+        end += batch_size
+
+
 @read_session
 def __container_to_datasets(scope, name, max_depth=0, _depth=0, session=None):
     """Flatten a container to a list of datasets.
@@ -196,19 +290,19 @@ def __count_rule(limit_check, rule, logger, session=None):
     Increment the counters for throttling from a rule
     """
     
-    if rule.did_type == DIDType.FILE:
+    if rule['did_type'] == DIDType.FILE:
         logger.debug('DID is a file')
         
         limit_check.increment(rules=1, replicas=1)
 
-    elif rule.did_type in [DIDType.DATASET, DIDType.CONTAINER]:
+    elif rule['did_type'] in [DIDType.DATASET, DIDType.CONTAINER]:
         # This DID is a dataset or a container
         # We count all the constituents regardless of the replication state to throttle on the maximum load
-        if rule.did_type == DIDType.DATASET:
-            dataset_condition = [and_(models.DataIdentifier.scope == rule.scope, models.DataIdentifier.name == rule.name)]
-        elif rule.did_type == DIDType.CONTAINER:
+        if rule['did_type'] == DIDType.DATASET:
+            dataset_condition = [and_(models.DataIdentifier.scope == rule['scope'], models.DataIdentifier.name == rule['name'])]
+        elif rule['did_type'] == DIDType.CONTAINER:
             dataset_condition = []
-            for s, n in __container_to_datasets(rule.scope, rule.name, session=session):
+            for s, n in __container_to_datasets(rule['scope'], rule['name'], session=session):
                 dataset_condition.append(
                     and_(models.DataIdentifier.scope == s, models.DataIdentifier.name == n)
                 )
@@ -227,70 +321,77 @@ def __count_rule(limit_check, rule, logger, session=None):
         
     else:
         # Unhandled DID type - warn and just increment the rules counter
-        type_str = str(rule.did_type).lower()
+        type_str = str(rule['did_type']).lower()
         logger.warning('DID type %(type_str)s found, but we can handle only FILE, DATASET, and CONTAINER types at the moment.' % locals())
         limit_check.increment(rules=1)
         
 
+@read_session
+def count_rules_pending_deletion(rse, rules, limit_check, session=None):
+    logger = logging.getLogger('decommissioning.%(rse)s' % locals())
+    
+    remaining_rules = []
+    
+    for rule in rules:
+        if rule['expires_at'] is None or rule['expires_at'] >= datetime.utcnow():
+            remaining_rules.append(rule)
+            continue
+        
+        rule_id = rule['id']
+        scope = rule['scope']
+        name = rule['name']
+        type_str = str(rule['did_type']).lower()
+
+        logger.debug('Rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s is bound for deletion' % locals())
+        
+        __count_rule(limit_check, rule, logger, session=session)
+        
+    return remaining_rules
+
+        
 @transactional_session
-def delete_single_rse_rules(rse, rse_id, limit_check, dry_run=False, session=None):
+def delete_single_rse_rules(rse, rules, limit_check, dry_run=False, session=None):
     """
     Delete rules with RSE expressions that consist only of the name of the given RSE.
     
     :param rse:          Name of the RSE.
-    :param rse_id:       RSE ID.
+    :param rules:        List of rules as dictionaries.
     :param limit_check:  LimitChecker instance
     :param session:      The database session.
     """
 
     logger = logging.getLogger('decommissioning.%(rse)s' % locals())
-
-    # Count the number of rules already scheduled for deletion (throttling).
-    # We can in principle save the rule-to-number of datasets/files mapping somewhere locally to avoid having to make queries
-    # every single time we call this function - to be considered
-    query = session.query(models.ReplicationRule).\
-        filter(models.ReplicationRule.rse_expression == rse).\
-        filter(models.ReplicationRule.expires_at is not None, models.ReplicationRule.expires_at < datetime.utcnow())
-
-    for rule in query.yield_per(5):
-        rule_id = rule.id
-        scope = rule.scope
-        name = rule.name
-        type_str = str(rule.did_type).lower()
-
-        logger.debug('Rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s is bound for deletion' % locals())
-        
-        __count_rule(limit_check, rule, logger, session=session)
+    
+    remaining_rules = []
 
     # Start counting how many rules, datasets, and replicas we delete in this function
     limit_check.start_local_count()
-
-    # Now start deleting more rules
-    query = session.query(models.ReplicationRule).\
-        filter(models.ReplicationRule.rse_expression == rse).\
-        filter(or_(models.ReplicationRule.expires_at.is_(None), models.ReplicationRule.expires_at >= datetime.utcnow()))
     
-    for rule in query.yield_per(5):
-        rule_id = rule.id
-        scope = rule.scope
-        name = rule.name
-        type_str = str(rule.did_type).lower()
+    for rule in rules:
+        if rule['rse_expression'] != rse or \
+            (rule['expires_at'] is not None and rule['expires_at'] <= datetime.utcnow()):
+            remaining_rules.append(rule)
+            continue
+            
+        rule_id = rule['id']
+        scope = rule['scope']
+        name = rule['name']
+        type_str = str(rule['did_type']).lower()
 
         logger.debug('Deleting rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s' % locals())
         if not dry_run:
             options = {'lifetime': 0, 'state': 'suspended', 'cancel_requests': True}
-            update_rule(rule.id, options, session=session)
+            #update_rule(rule['id'], options, session=session)
             
         __count_rule(limit_check, rule, logger, session=session)
 
-    num_rules = limit_check.local_deleted_rules        
-
     if limit_check.local_any():
+        num_rules = limit_check.local_deleted_rules
         logger.info('Deleted %(num_rules)s rules' % locals())
     else:
         logger.info('Found no trivial rule to delete')
         
-    return num_rules 
+    return remaining_rules
 
             
 @transactional_session
@@ -341,7 +442,7 @@ def process_multi_rse_rules(rse, rse_id, limit_check, dry_run=False, session=Non
     if not limit_check.local_any(reset=True):
         logger.info('Found no nontrivial rule to delete')
         
-      
+
 @read_session
 def scan_for_replicas(rse, rse_id, cache_path=None, dry_run=False, session=None):
     """
@@ -374,9 +475,84 @@ def scan_for_replicas(rse, rse_id, cache_path=None, dry_run=False, session=None)
     num_remaining_replicas = len(replicas)
     logger.info('%(num_remaining_replicas)s replicas remain on the RSE' % locals())
 
-    return num_remaining_replicas > 0
+    return replicas
 
 
+def __check_cached_objects(cache_path, query, row_condition, batch_size=1000, dry_run=False):
+    with open(cache_path, 'rb') as source:
+        cached_objects = pickle.load(source)
+        
+    if len(cached_objects) == 0:
+        return [], 0
+
+    conditions = []
+    for row in cached_objects:
+        conditions.append(and_(*row_condition(row)))
+       
+    remaining = []
+
+    if batch_size <= 0:
+        batch_size = len(conditions)
+        
+    begin = 0
+    end = batch_size
+
+    while begin < len(conditions):
+        result = query.filter(or_(*conditions[begin:end])).yield_per(100)
+
+        begin = end
+        end += batch_size
+
+        for row in result:
+            remaining.append(row.to_dict())
+
+    if not dry_run:
+        if len(remaining) == 0:
+            # Delete the cache file
+            os.unlink(cache_path)
+        else:
+            # Update the cache file with the new list
+            with open(cache_path, 'wb') as out:
+                pickle.dump(remaining, out, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return remaining, len(conditions)
+
+
+@read_session
+def check_cached_replica_rules(rse, rse_id, cache_path, batch_size=1000, dry_run=False, session=None):
+    """
+    Read the cached list of locks-replicas and check their existence in the ReplicaLock and ReplicationRule tables.
+    
+
+    """
+
+    logger = logging.getLogger('decommissioning.%(rse)s' % locals())
+
+    query = session.query(models.ReplicationRule).\
+        join(models.ReplicaLock, models.ReplicationRule.id == models.ReplicaLock.rule_id)
+
+    row_condition = lambda row: \
+        (models.ReplicationRule.scope == row['scope'],
+         models.ReplicationRule.name == row['name'],
+         models.ReplicationRule.rule_id == row['rule_id'],
+         models.ReplicaLock.rse_id == rse_id)
+
+    remaining_rules, num_cached = __check_cached_objects(cache_path, query, row_condition, dry_run=dry_run)
+
+    if num_cached == 0:
+        logger.info('There are no cached rules. RSE has likely been emptied in the previous run.')
+        return []
+
+    if len(remaining_rules) == 0:
+        logger.info('All %(num_cached)s cached rules are gone' % locals())
+        return []
+
+    num_remaining = len(remaining_rules)
+    logger.info('%(num_remaining)s rules remain on the RSE' % locals())
+
+    return remaining_rules
+    
+    
 @read_session
 def check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=False, session=None):
     """
@@ -390,88 +566,45 @@ def check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=Fals
 
     logger = logging.getLogger('decommissioning.%(rse)s' % locals())
 
-    with open(cache_path, 'rb') as source:
-        replicas = pickle.load(source)
-        
-    num_cached_replicas = len(replicas)
-        
-    if num_cached_replicas == 0:
+    query = session.query(models.RSEFileAssociation)
+
+    row_condition = lambda row: \
+        (models.RSEFileAssociation.scope == row['scope'],
+         models.RSEFileAssociation.name == row['name'],
+         models.RSEFileAssociation.rse_id == rse_id)
+
+    remaining_replicas, num_cached = __check_cached_objects(cache_path, query, row_condition, dry_run=dry_run)
+
+    if num_cached == 0:
         logger.info('There are no cached replicas. RSE has likely been emptied in the previous run.')
-        return False
+        return []
 
-    logger.info('Checking if %(num_cached_replicas)s replicas we found in the previous scan are still there' % locals())
+    if len(remaining_replicas) == 0:
+        logger.info('All %(num_cached)s cached replicas are gone' % locals())
+        return []
 
-    replicas_condition = []
-    for replica in replicas:
-        replicas_condition.append(
-            and_(models.RSEFileAssociation.scope == replica['scope'], models.RSEFileAssociation.name == replica['name'], models.RSEFileAssociation.rse_id == rse_id)
-        )
-       
-    remaining = []
-        
-    if batch_size > 0:
-        # Query in batches
-        begin = 0
-        end = batch_size
-        while begin < len(replicas_condition):
-            result = session.query(models.RSEFileAssociation).\
-                filter(or_(*replicas_condition[begin:end])).yield_per(100)
-            begin = end
-            end += batch_size
-            
-            for row in result:
-                remaining.append(row.to_dict())
-    else:
-        result = session.query(models.RSEFileAssociation).\
-            filter(or_(*replicas_condition)).yield_per(100)
-        
-        for row in result:
-            remaining.append(row.to_dict())
-            
-    if len(remaining) == 0:
-        logger.info('All cached replicas are gone')
-        if not dry_run:
-            # Delete the cache file
-            os.unlink(cache_path)
-        return False
+    num_remaining = len(remaining_replicas)
+    logger.info('%(num_remaining)s replicas remain on the RSE' % locals())
 
-    if not dry_run:
-        # Update the cache file with the new list
-        with open(cache_path, 'wb') as out:
-            pickle.dump(remaining, out, protocol=pickle.HIGHEST_PROTOCOL)
-
-    num_remaining_replicas = len(remaining)
-    logger.info('%(num_remaining_replicas)s remains on the RSE' % locals())
-
-    return True
+    return remaining_replicas
 
 
-@transactional_session    
-def decommission_rse_just_delete(rse, rse_id, limit_check, dry_run=False, session=None):
+@transactional_session
+def delete_rules(rse, rules, limit_check, dry_run=False, session=None):
     logger = logging.getLogger('decommissioning.%(rse)s' % locals())
     
-    deferred_action = 0
-    
     try:
-        # 1. Set RSE availability and greedyDeletion attributes
-        logger.info('Setting RSE availability flags')
-        set_rse_availability(rse, rse_id, dry_run=dry_run, session=session)
+        # 2.1 Count rules pending deletion
+        rules = count_rules_pending_deletion(rse, rules, limit_check, session=session)
         
-        # 2. Delete rules where the RSE expression is the RSE itself
+        # 2.2 Delete rules where the RSE expression is the RSE itself
         logger.info('Deleting trivial rules on the RSE')
-        delete_single_rse_rules(rse, rse_id, limit_check, dry_run=dry_run, session=session)
+        rules = delete_single_rse_rules(rse, rules, limit_check, dry_run=dry_run, session=session)
         
-        if not limit_check.any():
-            # # 3. Deal with rules with more complicated RSE expressions
-            # logger.info('Processing nontrivial rules' % locals())
-            # process_multi_rse_rules(rse, rse_id, limit_check, dry_run=dry_run, session=session)
+        # # 2.3 Delete rules resulting in the replica being only at this RSE
+        # logger.info('Deleting multi-RSE rules with replicas only at the RSE')
+        # rules = delete_multi_rse_single_replica_rules(rse, rules, limit_check, dry_run=dry_run, session=session)
 
-            if not limit_check.any():
-                # # 4. There were no rules to be deleted in this cycle - move on to final cleanup
-                # delete_locks_with_no_rule()
-                # delete_replicas_with_no_locks()
-                pass
-            
     except DeletionLimitExceeded as exc:
         reason = str(exc)
         logger.info('Stopping decommissioning cycle because %(reason)s' % locals())
@@ -480,31 +613,96 @@ def decommission_rse_just_delete(rse, rse_id, limit_check, dry_run=False, sessio
     if limit_check.any():
         num_rules = limit_check.deleted_rules
         logger.info('%(num_rules)s rules are being deleted. Decommissioning is not complete.' % locals())
-    elif deferred_action > 0:
+        return False
+    
+    elif len(rules) != 0:
+        num_remaining_rules = len(rules)
         # Nothing was deleted in this round but there are rules that we did not know how to delete
-        logger.info('%(deferred_action)s rules are being held because we do not know how to delete them.' % locals())
-    else:
-        # There is no more rule to delete - now check if there are remaining replicas on the RSE
+        logger.info('%(num_remaining_rules)s rules are being held because we do not know how to delete them.' % locals())
+        return False
 
-        cache_path = CACHE_DIR + ('/replicas_%(rse)s.pkl' % locals())
+    return True
+
+
+@transactional_session    
+def decommission_rse_just_delete(rse, rse_id, limit_check, dry_run=False, session=None):
+    logger = logging.getLogger('decommissioning.%(rse)s' % locals())
+    
+    # 1. Set RSE availability and greedyDeletion attributes
+    logger.info('Setting RSE availability flags')
+    set_rse_availability(rse, rse_id, dry_run=dry_run, session=session)
+
+    # 2. Identify replication rules through dataset replicas and delete 
+    logger.info('Collecting rules on datasets on the RSE')
+    rules = get_dataset_rules_by_rse_id(rse_id, session=session)
+
+    complete = delete_rules(rse, rules, limit_check, dry_run=dry_run, session=session)
+
+    if not complete:
+        return False
+
+    USE_REPLICA_LOCKS = False
+
+    if USE_REPLICA_LOCKS:
+        # 3. Identify replication rules through (file) replicas and delete
+        logging.info('Collecting rules on individual files on the RSE')
+
+        cache_path = CACHE_DIR + ('/replicarules_%(rse)s.pkl' % local())
         if os.path.exists(cache_path):
-            # There is a cached list of replicas from a previous scan. Let's check those replicas first
-            replicas_exist = check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=dry_run, session=session)
-            if replicas_exist:
-                logger.info('Decommissioning is not complete.')
-                return True
+            # There is a cached list of file-level rules from a previous scan. Let's check those rules first
+            rules = check_cached_replica_rules(rse, rse_id, cache_path, batch_size=1000, dry_run=dry_run, session=session)
+    
+        if len(rules) == 0:
+            logger.info('Scanning the ReplicaLock table for remaining replicas on this RSE. This will take a few minutes..')
+            # Even though this is a read operation, it's a costly one
+            # -> Let's not actually run the query in dry run mode.
+            if not dry_run:
+                rules = get_file_rules_by_rse_id(rse_id, cache_path=cache_path, session=session)
 
+    else:
+        # ReplicaLock table is not indexed by RSE, just like RSEFileAssociation (replicas). We may want to limit expensive
+        # full-table scans to minimum -> Do the replicas scan here and look up the rules locking those replicas. The list
+        # of replicas can then be cached and used later
+
+        # 3. Identify replication rules through (file) replicas and delete
+        logging.info('Collecting rules on individual files on the RSE')
+
+        cache_path = CACHE_DIR + ('/replicas_%(rse)s.pkl' % local())
+        if os.path.exists(cache_path):
+            # There is a cached list of file-level rules from a previous scan. Let's check those rules first
+            replicas = check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=dry_run, session=session)
+        else:
+            replicas = scan_for_replicas(rse, rse_id, cache_path=cache_path, dry_run=dry_run, session=session)
+
+        rules = get_file_rules_from_replicas(replicas, batch_size=1000, session=session)
+
+    complete = delete_rules(rse, rules, limit_check, dry_run=dry_run, session=session)
+
+    if not complete:
+        return False
+    
+    # There are no more rules - now check if there are remaining replicas on the RSE
+    replicas = []
+
+    cache_path = CACHE_DIR + ('/replicas_%(rse)s.pkl' % locals())
+    if os.path.exists(cache_path):
+        # There is a cached list of replicas from a previous scan. Let's check those replicas first
+        replicas = check_cached_replicas(rse, rse_id, cache_path, batch_size=1000, dry_run=dry_run, session=session)
+        
+    if len(replicas) == 0:
         # No cache or cached list is all clear - do a one last scan
-        replicas_exist = scan_for_replicas(rse, rse_id, cache_path=cache_path, dry_run=dry_run, session=session)
-        if replicas_exist:
-            logger.info('Decommissioning is not complete.')
-            return True
-
+        replicas = scan_for_replicas(rse, rse_id, cache_path=cache_path, dry_run=dry_run, session=session)
+        
+    if len(replicas) == 0:
         # The RSE is now really completely cleared
         logger.info('Completed deleting the RSE contents')
         mark_rse_as_done(rse, rse_id, dry_run=dry_run, session=session)
-    
-    return True
+        return True
+
+    else:
+        num_replicas = len(replicas)
+        logger.warning('%(num_replicas)s replicas remain on the RSE even though there are no more rules creating locks on them.' % locals())
+        return False
 
 
 @transactional_session
@@ -571,6 +769,9 @@ def decommission_rses(rses=[],
                       dry_run=True,
                       session=None):
 
+    if not dry_run and max_replicas < 0 and max_rules < 0 and max_datasets < 0:
+        raise RuntimeError('Throttling required for a non-dry run')
+    
     profiles = {}
     
     # Loop over the RSEs with decommission attribute set
