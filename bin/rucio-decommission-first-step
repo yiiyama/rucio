@@ -451,7 +451,7 @@ def delete_single_rse_rules(rse, rules, limit_check, dry_run=False, session=None
         logger.debug('Deleting rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s' % locals())
         if not dry_run:
             options = {'lifetime': 0, 'state': 'suspended', 'cancel_requests': True}
-            #update_rule(rule_id, options, session=session)
+            update_rule(rule_id, options, session=session)
             
         __count_rule(limit_check, rule, logger, session=session)
 
@@ -502,7 +502,7 @@ def delete_rules_with_one_replica(rse, rules, limit_check, dry_run=False, sessio
         logger.debug('Deleting rule %(rule_id)s for %(type_str)s %(scope)s:%(name)s' % locals())
         if not dry_run:
             options = {'lifetime': 0, 'state': 'suspended', 'cancel_requests': True}
-            #update_rule(rule_id, options, session=session)
+            update_rule(rule_id, options, session=session)
             
         __count_rule(limit_check, rule, logger, session=session)
 
